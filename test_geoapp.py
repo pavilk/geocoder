@@ -39,8 +39,8 @@ async def test_save_and_get_cached_address():
     await save_address(query, "Test full address", 55.5, 37.5)
     cached = await get_cached_address(query)
     assert cached is not None
-    assert cached.input_query == query
-    assert cached.latitude == 55.5
+    assert cached[0].input_query == query
+    assert cached[0].latitude == 55.5
 
 
 # Моки Dadata + Nominatim
@@ -68,18 +68,21 @@ async def test_handle_address_input_success(
 
 @pytest.mark.asyncio
 @patch("services.geocoder.input", return_value="55.75 37.61")
-@patch("services.geocoder.fetch_json")
+@patch("services.geocoder.fetch_json", new_callable=AsyncMock)
 @patch("services.geocoder.save_address", new_callable=AsyncMock)
 @patch("services.geocoder.get_cached_address", new_callable=AsyncMock, return_value=None)
-async def test_handle_coordinates_input_success(mock_cache, mock_save, mock_fetch, mock_input):
-    mock_fetch.return_value = {
-        "display_name": "Москва, Россия"
-    }
+async def test_handle_coordinates_input_success(
+    mock_cache, mock_save, mock_fetch, mock_input
+):
+    mock_fetch.return_value = [
+        {"display_name": "Москва, Россия"}
+    ]
 
     await handle_coordinates_input()
 
-    mock_fetch.assert_called_once()
+    mock_fetch.assert_awaited_once()
     mock_save.assert_awaited_once()
+
 
 
 @pytest.mark.asyncio
