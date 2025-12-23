@@ -5,7 +5,7 @@ from sqlalchemy import select
 async def get_cached_address(query: str):
     async with async_session() as session:
         result = await session.execute(select(Address).where(Address.input_query == query))
-        return result.scalar_one_or_none()
+        return result.scalars().all()
 
 
 async def save_address(query: str, full_address: str, lat: float, lon: float):

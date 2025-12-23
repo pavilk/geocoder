@@ -1,18 +1,26 @@
 import aiohttp
+import os
 from dadata import Dadata
 from database.cache import get_cached_address, save_address
+from database.places import get_cached_places
+from dotenv import load_dotenv
+from httpx import HTTPStatusError
+import httpx
 
-DADATA_TOKEN = "52a1b45a5b5ff4923bac96cc0f0453ace082e9ab"
-DADATA_SECRET = "669e20c2239bc14137989e5d4375582dc68d9e98"
+load_dotenv()
+
+DADATA_TOKEN = os.getenv("DADATA_TOKEN")
+DADATA_SECRET = os.getenv("DADATA_SECRET")
+
 dadata = Dadata(DADATA_TOKEN, DADATA_SECRET)
 
 
 def clean_address(raw_address: str):
     try:
         return dadata.clean("address", raw_address)
-    except Exception as e:
+    except HTTPStatusError as e:
         print(f"Ошибка Dadata: {e}")
-        return None
+        return e
 
 
 async def fetch_json(url, params):
@@ -22,6 +30,37 @@ async def fetch_json(url, params):
         async with session.get(url, params=params) as resp:
             resp.raise_for_status()
             return await resp.json()
+
+
+async def fetch_overpass(lat: float, lon: float, radius: int = 200):
+    query = f"""
+    [out:json];
+    (
+      node(around:{radius},{lat},{lon})["amenity"];
+      node(around:{radius},{lat},{lon})["shop"];
+      node(around:{radius},{lat},{lon})["office"];
+    );
+    out tags;
+    """
+    url = "https://overpass-api.de/api/interpreter"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, data=query) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+
+async def fetch_addresses_by_coords(lat: float, lon: float, limit: int = 5):
+    return await fetch_json(
+        "https://nominatim.openstreetmap.org/search",
+        {
+            "q": f"{lat}, {lon}",
+            "format": "json",
+            "limit": limit,
+            "accept-language": "ru",
+        },
+    )
+
+
 
 
 async def handle_address_input():
@@ -36,33 +75,55 @@ async def handle_address_input():
     full_address = f"{city} {street} {house}"
 
     cleaned = clean_address(full_address)
-    if not cleaned:
-        print("Ошибка нормализации адреса.")
+    if isinstance(cleaned, Exception):
+        print("Ошибка нормализации адреса")
         return
 
-    finall_addres = f"Россия {cleaned.get('city')} {cleaned.get('street')} {cleaned.get('house')}"
-    if not finall_addres:
-        print("Ошибка нормализации адреса.")
-        return
+    final_address = f"Россия {cleaned.get('city')} {cleaned.get('street')} {cleaned.get('house')}"
 
-    cached = await get_cached_address(finall_addres)
+    cached = await get_cached_address(final_address)
+
     if cached:
-        print(f"[Кеш]\nШирота: {cached.latitude}, Долгота: {cached.longitude}")
+        print(f"[Кеш]\nШирота: {cached[0].latitude}, Долгота: {cached[0].longitude}")
+        places = await get_cached_places(final_address)
+        print(places)
         return
 
     try:
-        print(f"Поиск по адресу: {finall_addres}")
+        print(f"Поиск по адресу: {final_address}")
         data = await fetch_json(
             "https://nominatim.openstreetmap.org/search",
-            {"q": finall_addres, "format": "json", "limit": 1, "accept-language": "ru"},
+            {"q": final_address, "format": "json", "limit": 5, "accept-language": "ru"},
         )
+
         if not data:
             print("Адрес не найден.")
             return
 
-        lat, lon = data[0]["lat"], data[0]["lon"]
+        answer = data[0]
+        lat, lon = float(answer["lat"]), float(answer["lon"])
+
         print(f"Широта: {lat}, Долгота: {lon}")
-        await save_address(finall_addres, data[0]["display_name"], float(lat), float(lon))
+        await save_address(final_address, answer["display_name"], lat, lon)
+
+        orgs = await fetch_overpass(lat, lon)
+
+        print("\nОрганизации рядом:")
+        if not orgs["elements"]:
+            print("Не найдено")
+            return
+
+        for el in orgs["elements"]:
+            tags = el.get("tags", {})
+            name = tags.get("name", "Без названия")
+            kind = (
+                tags.get("amenity")
+                or tags.get("shop")
+                or tags.get("office")
+                or "unknown"
+            )
+            print(f"- {name} ({kind})")
+
     except Exception as e:
         print(f"Ошибка запроса: {e}")
 
@@ -70,6 +131,7 @@ async def handle_address_input():
 async def handle_coordinates_input():
     coords = input("Введите широту и долготу через пробел: ").strip()
     parts = coords.split()
+
     if len(parts) != 2:
         print("Нужно ввести два числа: широту и долготу.")
         return
@@ -81,24 +143,29 @@ async def handle_coordinates_input():
         print("Широта и долгота должны быть числами.")
         return
 
-    query = f"{lat} {lon}"
-
-    cached = await get_cached_address(query)
-    if cached:
-        print(f"[Кеш]\nАдрес: {cached.full_address}")
-        return
+    print(f"\nПоиск адресов для: {lat}, {lon}")
 
     try:
-        data = await fetch_json(
-            "https://nominatim.openstreetmap.org/reverse",
-            {"lat": lat, "lon": lon, "format": "json", "accept-language": "ru"},
-        )
-        address = data.get("display_name")
-        if not address:
-            print("Адрес по координатам не найден.")
+        results = await fetch_addresses_by_coords(lat, lon)
+
+        if not results:
+            print("Адреса не найдены.")
             return
 
-        print(f"Адрес: {address}")
-        await save_address(query, address, lat, lon)
+        print("\nВозможные адреса:")
+        for i, item in enumerate(results, 1):
+            print(f"{i}. {item.get('display_name')}")
+
+        # сохраняем самый точный
+        best = results[0]
+        await save_address(
+            f"{lat} {lon}",
+            best["display_name"],
+            lat,
+            lon,
+        )
+
     except Exception as e:
         print(f"Ошибка запроса: {e}")
+
+
